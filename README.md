@@ -1,4 +1,6 @@
+# Building a k3s cluster with ansible
 
+This is the complementary repository to my Blog Post where you can find the full code I'am rambling about in the post.
 
 # Variables file
 I use a variables file to keep all the secrets out of this repository here is the stub of the variable file for you to use:
