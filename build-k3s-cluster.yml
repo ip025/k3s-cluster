@@ -1,0 +1,358 @@
+---
+- hosts: k3s
+  gather_facts: true
+  become: true
+  tasks:
+    - name: ensure dependencies are installed
+      ansible.builtin.package:
+        name: nfs-common
+        state: present
+
+- hosts: k3s-server
+  gather_facts: false
+  vars_files:
+    - variables.yml
+  become: true
+  tasks:
+    - name: check if we initiated a cluster
+      ansible.builtin.stat:
+        path: /var/lib/rancher/k3s/server/node-token
+        get_checksum: false
+      register: cluster
+      
+    - ansible.builtin.debug:
+        var: cluster
+        verbosity: 1
+
+    - name: initiate the cluster
+      block:
+        - name: get the installer script
+          ansible.builtin.get_url:
+            url: https://get.k3s.io
+            dest: /root/k3s.sh
+            mode: '0500'
+
+        - name: run the installer script
+          ansible.builtin.command: sh k3s.sh
+          args:
+            chdir: /root
+            creates: /var/lib/rancher/k3s/server/node-token
+          environment:
+            INSTALL_K3S_EXEC: "--service-node-port-range 1000-32767" # we need lower ports for the unifi controller
+
+        # - name: ensure pip is present
+        #   ansible.builtin.package:
+        #     name: python3-pip
+        #     state: present
+
+        # - name: ensure python dependencies are present
+        #   ansible.builtin.pip:
+        #     name: pyyaml
+        #     state: present
+
+        # - name: ensure the cilium helm repo is installed
+        #   kubernetes.core.helm_repository:
+        #     repo_name: cilium
+        #     repo_url: https://helm.cilium.io/
+        #     repo_state: present
+
+        # - name: deploy the cilium helm chart to the cluster
+        #   kubernetes.core.helm:
+        #     name: cilium
+        #     chart_ref: cilium/cilium
+        #     release_namespace: kube-system
+        #     wait: true
+        #     kubeconfig: "{{ KUBECONFIG }}"
+        #     # values:
+        #     #   disableEnvoyVersionCheck: true # https://github.com/cilium/cilium/issues/14117#issuecomment-761271341
+
+      when: not cluster.stat.exists
+
+    - name: get cluster token
+      ansible.builtin.slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: node_token_raw
+
+    - set_fact:
+        node_token: "{{ node_token_raw['content'] | b64decode | trim }}"
+
+    - debug:
+        var: node_token
+        verbosity: 1
+
+- hosts: k3s-agent
+  gather_facts: false
+  become: true
+  tasks:
+    - name: check if we already joined the cluster
+      ansible.builtin.stat:
+        path: /var/lib/rancher/k3s/agent/server-ca.crt
+        get_checksum: false
+      register: server_ca
+
+    - name: join cluster
+      block:
+        - name: get join script
+          get_url:
+            url: https://get.k3s.io
+            dest: /root/k3s.sh
+            mode: '0500'
+
+        - name: run join script
+          command: sh k3s.sh
+          args:
+            chdir: /root
+          environment:
+            K3S_URL: "https://{{ groups['k3s-server'] | first }}:6443"
+            K3S_TOKEN: "{{ hostvars[groups['k3s-server'] | first]['node_token'] }}"
+      when: not server_ca.stat.exists
+
+- hosts: k3s
+  gather_facts: false
+  vars_files:
+    - variables.yml
+  tasks:
+    - name: deploy healthchecks
+      kubernetes.core.k8s:
+        state: present
+        kubeconfig: "{{ KUBECONFIG }}"
+        definition:
+          apiVersion: batch/v1
+          kind: CronJob
+          metadata:
+            name: "{{ inventory_hostname }}-healthcheck"
+            namespace: default
+          spec:
+            successfulJobsHistoryLimit: 1
+            failedJobsHistoryLimit: 1
+            schedule: "*/5 * * * *"
+            jobTemplate:
+              spec:
+                template:
+                  spec:
+                    nodeSelector:
+                      kubernetes.io/hostname: "{{ inventory_hostname }}"
+                    containers:
+                    - name: curlimage
+                      image: curlimages/curl
+                      imagePullPolicy: IfNotPresent
+                      command:
+                      - sh
+                      - -c
+                      args:
+                      - curl $SERVICE_URL
+                      env:
+                      - name: SERVICE_URL
+                        value: "{{ HEALTHCHECK_HOOKURL }}"
+                    restartPolicy: OnFailure
+      delegate_to: "{{ groups['k3s-server'] | first }}"
+
+- hosts: k3s-server
+  gather_facts: false
+  vars_files:
+    - variables.yml
+  become: true
+  tasks:
+    - name: ensure pip is present
+      ansible.builtin.package:
+        name: python3-pip
+        state: present
+
+    - name: ensure python dependencies are present
+      ansible.builtin.pip:
+        name: 
+          - pyyaml
+          - kubernetes
+        state: present
+
+    - name: deploy kwatch
+      block:
+        - name: deploy the kwatch namespace
+          kubernetes.core.k8s:
+            kubeconfig: "{{ KUBECONFIG }}"
+            definition:
+              apiVersion: v1
+              kind: Namespace
+              metadata:
+                name: kwatch
+
+        - name: ensure the configmap is present
+          kubernetes.core.k8s:
+            kubeconfig: "{{ KUBECONFIG }}"
+            definition:
+                apiVersion: v1
+                kind: ConfigMap
+                metadata:
+                  name: kwatch
+                  namespace: kwatch
+                data:
+                  config.yaml: |
+                    maxRecentLogLines: 50
+                    ignoreFailedGracefulShutdown: true
+                    alert:
+                      telegram:
+                          token: "{{ TELEGRAM_TOKEN }}"
+                          chatId: "{{ TELEGRAM_CHATID }}"
+        
+        - name: download the deployment manifest
+          ansible.builtin.get_url:
+            url: "https://raw.githubusercontent.com/abahmed/kwatch/{{ KWATCH_VERSION }}/deploy/deploy.yaml"
+            dest: /root/kwatch_deploy.yaml
+            mode: "0664"
+
+        - name: deploy the kwatch yaml
+          kubernetes.core.k8s:
+            kubeconfig: "{{ KUBECONFIG }}"
+            state: present
+            src: /root/kwatch_deploy.yaml
+      when: KWATCH_ENABLED
+
+    - name: ensure the nfs-provisioner helm chart is installed
+      kubernetes.core.helm_repository:
+        repo_name: nfs-subdir-external-provisioner
+        repo_url: https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner/
+        repo_state: present
+
+    - name: deploy the nfs-provisioner
+      kubernetes.core.helm:
+        name: nfs-subdir-external-provisioner
+        chart_ref: nfs-subdir-external-provisioner/nfs-subdir-external-provisioner
+        release_namespace: kube-system
+        wait: true
+        kubeconfig: "{{ KUBECONFIG }}"
+        values:
+          nfs:
+            server: "{{ NFS_SERVER_HOST }}"
+            path: "{{ NFS_SERVER_PATH }}"
+
+          affinity:
+            nodeAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+                - weight: 1
+                  preference:
+                    matchExpressions:
+                    - key: kubernetes.io/hostname
+                      operator: In
+                      values:
+                      - monkeyrocket
+
+    - name: deploy traefik https redirect middleware
+      kubernetes.core.k8s:
+        name: redirect-https
+        state: present
+        namespace: default
+        kubeconfig: "{{ KUBECONFIG }}"
+        definition:
+          apiVersion: traefik.containo.us/v1alpha1
+          kind: Middleware
+          metadata:
+            name: redirect-https
+          spec:
+            redirectScheme:
+              scheme: https
+              permanent: true
+
+    - name: deploy cert manager
+      block:
+        - name: create cf token
+          kubernetes.core.k8s:
+            name: cloudflare-api-token-secret
+            state: present
+            namespace: cert-manager
+            kubeconfig: "{{ KUBECONFIG }}"
+            definition:
+              apiVersion: v1
+              kind: Secret
+              metadata:
+                name: cloudflare-api-token-secret
+              type: Opaque
+              stringData:
+                api-token: "{{ CF_USER_TOKEN }}"
+
+        - name: ensure the cert-manager helm chart is installed
+          kubernetes.core.helm_repository:
+            repo_name: jetstack
+            repo_url: https://charts.jetstack.io
+            repo_state: present
+
+        - name: deploy the cert-manager
+          kubernetes.core.helm:
+            name: cert-manager
+            chart_ref: jetstack/cert-manager
+            wait: true
+            kubeconfig: "{{ KUBECONFIG }}"
+            release_namespace: cert-manager
+            create_namespace: true
+            values:
+              installCRDs: true
+
+              nodeSelector:
+                kubernetes.io/hostname: monkeyrocket
+              affinity:
+                nodeAffinity:
+                  preferredDuringSchedulingIgnoredDuringExecution:
+                    - weight: 1
+                      preference:
+                        matchExpressions:
+                        - key: kubernetes.io/hostname
+                          operator: In
+                          values:
+                          - monkeyrocket
+              webhook:
+                affinity:
+                  nodeAffinity:
+                    preferredDuringSchedulingIgnoredDuringExecution:
+                      - weight: 1
+                        preference:
+                          matchExpressions:
+                          - key: kubernetes.io/hostname
+                            operator: In
+                            values:
+                            - monkeyrocket
+              cainjector:
+                affinity:
+                  nodeAffinity:
+                    preferredDuringSchedulingIgnoredDuringExecution:
+                      - weight: 1
+                        preference:
+                          matchExpressions:
+                          - key: kubernetes.io/hostname
+                            operator: In
+                            values:
+                            - monkeyrocket
+              startupapicheick:
+                affinity:
+                  nodeAffinity:
+                    preferredDuringSchedulingIgnoredDuringExecution:
+                      - weight: 1
+                        preference:
+                          matchExpressions:
+                          - key: kubernetes.io/hostname
+                            operator: In
+                            values:
+                            - monkeyrocket
+        
+        - name: create ACME cluster issuer (prod)
+          kubernetes.core.k8s:
+            name: letsencrypt-prod
+            state: present
+            namespace: default
+            kubeconfig: "{{ KUBECONFIG }}"
+            definition:
+              apiVersion: cert-manager.io/v1
+              kind: ClusterIssuer
+              metadata:
+                name: letsencrypt-prod
+              spec:
+                acme:
+                  email: "{{ ACME_USER_EMAIL }}"
+                  server: "{{ ACME_SERVER }}"
+                  privateKeySecretRef:
+                    name: prod-issuer-account-key
+                  solvers:
+                  - dns01:
+                      cloudflare:
+                        email: "{{ CF_USER_EMAIL }}"
+                        apiTokenSecretRef:
+                          name: cloudflare-api-token-secret
+                          key: api-token
